@@ -1,0 +1,16 @@
+## Interface: 110000,110005,110007,110100,110105,110200,110205,120000,120001,120002
+## Title: Buff Swipe Toggle
+## Notes: Per-CooldownViewer swipe + per-viewer cooldown text X/Y offsets (Blizzard CooldownViewers).
+## Author: You
+## Version: 1.4.0
+
+## SavedVariables: BuffSwipeToggleDB
+## SavedVariablesPerCharacter: BuffSwipeToggleCharDB
+
+## IconTexture: Interface\Icons\INV_Misc_PocketWatch_01
+
+## AddonCompartmentFunc: BuffSwipeToggle_OnAddonCompartmentClick
+## AddonCompartmentFuncOnEnter: BuffSwipeToggle_OnAddonCompartmentEnter
+## AddonCompartmentFuncOnLeave: BuffSwipeToggle_OnAddonCompartmentLeave
+
+BuffSwipeToggle.lua
