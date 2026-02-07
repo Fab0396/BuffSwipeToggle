@@ -1,10 +1,10 @@
 -- BuffSwipeToggle.lua
--- Fixes:
---  - Removes invalid SetPoint anchoring button to itself (was breaking UI + hiding viewer list)
---  - Bottom row buttons remain centered group layout
---  - Close "X" uses UIPanelButtonTemplate so it renders
---  - Clean top border (main border only) + titlebar fill + bottom separator
---  - Grey theme + 2px black borders + grey buttons w/ white text
+-- Fix for: "attempt to compare local 'p' (a secret value)"
+-- Changes:
+-- - NEVER directly compare GetPoint() returns (p/rp/ox/oy) with == anymore.
+-- - PointName() no longer calls :find() on secret strings (uses safe tostring).
+-- - IsFSAtDesired() uses SafeEq for p/rp and SafeNum for ox/oy.
+-- - Keeps the “don’t reposition text in combat” safeguard + re-apply after combat.
 
 local ADDON_NAME = ...
 local BST = {}
@@ -13,6 +13,24 @@ _G.BuffSwipeToggle = BST
 BuffSwipeToggleDB = BuffSwipeToggleDB or nil
 BuffSwipeToggleCharDB = BuffSwipeToggleCharDB or nil
 
+local ANCHORS = {
+	{ key = "TOPLEFT",     text = "Top Left" },
+	{ key = "TOP",         text = "Top" },
+	{ key = "TOPRIGHT",    text = "Top Right" },
+	{ key = "LEFT",        text = "Left" },
+	{ key = "CENTER",      text = "Center" },
+	{ key = "RIGHT",       text = "Right" },
+	{ key = "BOTTOMLEFT",  text = "Bottom Left" },
+	{ key = "BOTTOM",      text = "Bottom" },
+	{ key = "BOTTOMRIGHT", text = "Bottom Right" },
+
+	{ key = "EDGETOP",     text = "Edge Top" },
+	{ key = "EDGEBOTTOM",  text = "Edge Bottom" },
+}
+
+local ANCHOR_TEXT = {}
+for i = 1, #ANCHORS do ANCHOR_TEXT[ANCHORS[i].key] = ANCHORS[i].text end
+
 local DEFAULTS = {
 	minimap = { show = true, angle = 220 },
 	useCharacterSettings = false,
@@ -20,7 +38,11 @@ local DEFAULTS = {
 
 	knownViewers = {},
 	swipe = {},
-	textPos = {},
+
+	durationPos = {},
+	stackPos = {},
+
+	textPos = {}, -- legacy
 	lastSeen = {},
 
 	ui = {
@@ -28,6 +50,16 @@ local DEFAULTS = {
 		selectedViewer = "",
 	},
 }
+
+BST._viewerByCooldown   = setmetatable({}, { __mode = "k" })
+BST._appliedByCooldown  = setmetatable({}, { __mode = "k" })
+BST._cooldownsByViewer  = {}
+BST._fullScanPending    = false
+BST._lastFullScan       = 0
+
+-- -------------------------------------------------------
+-- Utilities
+-- -------------------------------------------------------
 
 local function DeepCopyDefaults(dst, src)
 	if type(dst) ~= "table" then dst = {} end
@@ -45,6 +77,8 @@ local function EnsureTables(db)
 	db.minimap = db.minimap or { show = true, angle = 220 }
 	db.knownViewers = db.knownViewers or {}
 	db.swipe = db.swipe or {}
+	db.durationPos = db.durationPos or {}
+	db.stackPos = db.stackPos or {}
 	db.textPos = db.textPos or {}
 	db.lastSeen = db.lastSeen or {}
 	db.ui = db.ui or {}
@@ -63,6 +97,89 @@ end
 function BST:Print(msg)
 	DEFAULT_CHAT_FRAME:AddMessage(("|cff66ccff[BuffSwipeToggle]|r %s"):format(msg))
 end
+
+local function IsFrame(v)
+	return type(v) == "table" and type(v.GetObjectType) == "function" and v:GetObjectType() == "Frame"
+end
+
+local function IsFontString(o)
+	return type(o) == "table" and type(o.GetObjectType) == "function" and o:GetObjectType() == "FontString"
+end
+
+local function ClampInt(n, lo, hi)
+	n = tonumber(n)
+	if not n then return 0 end
+	n = math.floor(n + 0.5)
+	if n < lo then n = lo end
+	if n > hi then n = hi end
+	return n
+end
+
+local function IsNumericText(s)
+	return type(s) == "string" and s ~= "" and s:match("%d")
+end
+
+-- Backwards compat: old "EDGE" -> EDGETOP
+local function SafeAnchor(a)
+	if a == "EDGE" then return "EDGETOP" end
+	if ANCHOR_TEXT[a] then return a end
+	return "CENTER"
+end
+
+-- Safe equality (secret-value safe)
+local function SafeEq(a, b)
+	local ok, res = pcall(function() return a == b end)
+	return ok and res or false
+end
+
+-- Safe tostring (secret-value safe)
+local function SafeToString(v)
+	if v == nil then return "" end
+	local ok, s = pcall(function() return tostring(v) end)
+	if ok and type(s) == "string" then return s end
+	return ""
+end
+
+-- Safe tonumber (secret-value safe)
+local function SafeNum(v)
+	if v == nil then return 0 end
+	local ok, n = pcall(function() return tonumber(v) end)
+	if ok and n then return n end
+	return 0
+end
+
+-- Safe GetPoint
+local function SafeGetPoint(fs)
+	if not fs or type(fs.GetPoint) ~= "function" then return nil end
+	local ok, p, rel, rp, ox, oy = pcall(fs.GetPoint, fs, 1)
+	if not ok then return nil end
+	return p, rel, rp, ox, oy
+end
+
+-- Edge Top/Bottom: text CENTER sits on the edge line
+local function GetDesiredPoint(anchor, x, y)
+	anchor = SafeAnchor(anchor)
+	x = tonumber(x) or 0
+	y = tonumber(y) or 0
+
+	if anchor == "EDGETOP" then
+		return "CENTER", "TOP", x, y
+	elseif anchor == "EDGEBOTTOM" then
+		return "CENTER", "BOTTOM", x, y
+	end
+
+	return anchor, anchor, x, y
+end
+
+local function ApplyFS(fs, cooldown, anchor, x, y)
+	local fsP, cdP, dx, dy = GetDesiredPoint(anchor, x, y)
+	fs:ClearAllPoints()
+	fs:SetPoint(fsP, cooldown, cdP, dx, dy)
+end
+
+-- -------------------------------------------------------
+-- DB / active profile
+-- -------------------------------------------------------
 
 function BST:GetAccountDB() return BuffSwipeToggleDB end
 function BST:GetCharDB() return BuffSwipeToggleCharDB end
@@ -88,118 +205,63 @@ function BST:EnsureInit()
 	if not self._dbReady then self:InitDB() end
 end
 
-function BST:SetUseCharacterSettings(flag)
-	self:EnsureInit()
-	local c = self:GetCharDB()
-	if not c then return end
-	c.useCharacterSettings = not not flag
-
-	if c.useCharacterSettings then
-		local a = self:GetAccountDB()
-		EnsureTables(a); EnsureTables(c)
-
-		if c.defaultNewViewerSwipe == nil then c.defaultNewViewerSwipe = a.defaultNewViewerSwipe end
-		if c.minimap.show == nil then c.minimap.show = a.minimap.show end
-		if c.minimap.angle == nil then c.minimap.angle = a.minimap.angle end
-
-		if c.ui.compact == nil then c.ui.compact = a.ui.compact end
-		if c.ui.selectedViewer == nil then c.ui.selectedViewer = a.ui.selectedViewer end
-
-		for vn in pairs(a.knownViewers) do
-			c.knownViewers[vn] = true
-			if c.swipe[vn] == nil and a.swipe[vn] ~= nil then c.swipe[vn] = a.swipe[vn] end
-			if c.textPos[vn] == nil and a.textPos[vn] ~= nil then
-				c.textPos[vn] = { x = a.textPos[vn].x or 0, y = a.textPos[vn].y or 0 }
-			end
-			if c.lastSeen[vn] == nil and a.lastSeen[vn] ~= nil then
-				c.lastSeen[vn] = a.lastSeen[vn]
-			end
-		end
-	end
-
-	self:RefreshAll()
-	self:RefreshConfig()
-end
-
--- ---------- Viewer discovery ----------
-
-local function IsFrame(v)
-	return type(v) == "table" and type(v.GetObjectType) == "function" and v:GetObjectType() == "Frame"
-end
+-- -------------------------------------------------------
+-- Viewer defaults + settings
+-- -------------------------------------------------------
 
 function BST:EnsureViewerDefaults(vn)
-	if not vn then return end
+	if not vn or vn == "" then return end
 	self:EnsureInit()
 	local db = self:GetActiveDB()
 	if not db then return end
 	EnsureTables(db)
 
 	db.knownViewers[vn] = true
-	if db.swipe[vn] == nil then db.swipe[vn] = not not db.defaultNewViewerSwipe end
 
-	if db.textPos[vn] == nil then
-		db.textPos[vn] = { x = 0, y = 0 }
-	else
-		db.textPos[vn].x = tonumber(db.textPos[vn].x) or 0
-		db.textPos[vn].y = tonumber(db.textPos[vn].y) or 0
+	if db.swipe[vn] == nil then
+		db.swipe[vn] = not not db.defaultNewViewerSwipe
 	end
 
-	if db.lastSeen[vn] == nil then db.lastSeen[vn] = 0 end
+	-- legacy migrate
+	if db.durationPos[vn] == nil then
+		local legacy = db.textPos[vn]
+		if type(legacy) == "table" then
+			db.durationPos[vn] = { anchor = "CENTER", x = tonumber(legacy.x) or 0, y = tonumber(legacy.y) or 0 }
+		else
+			db.durationPos[vn] = { anchor = "CENTER", x = 0, y = 0 }
+		end
+	else
+		local p = db.durationPos[vn]
+		p.anchor = SafeAnchor(p.anchor)
+		p.x = tonumber(p.x) or 0
+		p.y = tonumber(p.y) or 0
+	end
+
+	if db.stackPos[vn] == nil then
+		db.stackPos[vn] = { anchor = "BOTTOMRIGHT", x = 0, y = 0 }
+	else
+		local p = db.stackPos[vn]
+		p.anchor = SafeAnchor(p.anchor)
+		p.x = tonumber(p.x) or 0
+		p.y = tonumber(p.y) or 0
+	end
+
+	if db.lastSeen[vn] == nil then
+		db.lastSeen[vn] = 0
+	end
+
+	if not self._cooldownsByViewer[vn] then
+		self._cooldownsByViewer[vn] = setmetatable({}, { __mode = "k" })
+	end
 end
 
 function BST:MarkSeen(vn)
-	if not vn then return end
-	self:EnsureInit()
+	if not vn or vn == "" then return end
 	local db = self:GetActiveDB()
 	if not db then return end
 	EnsureTables(db)
 	db.lastSeen[vn] = time()
 end
-
-function BST:DiscoverViewers()
-	self:EnsureInit()
-	local db = self:GetActiveDB()
-	if not db then return end
-	EnsureTables(db)
-
-	local found = {}
-
-	for _, name in ipairs({ "BuffIconCooldownViewer", "EssentialCooldownViewer", "UtilityCooldownViewer" }) do
-		if _G[name] and IsFrame(_G[name]) then found[name] = true end
-	end
-
-	for k, v in pairs(_G) do
-		if type(k) == "string" and k:match("CooldownViewer$") and IsFrame(v) then
-			found[k] = true
-		end
-	end
-
-	local f = EnumerateFrames()
-	while f do
-		if f.viewerFrame and IsFrame(f.viewerFrame) and type(f.viewerFrame.GetName) == "function" then
-			local vn = f.viewerFrame:GetName()
-			if vn then found[vn] = true end
-		end
-		f = EnumerateFrames(f)
-	end
-
-	for vn in pairs(found) do
-		self:EnsureViewerDefaults(vn)
-		self:MarkSeen(vn)
-	end
-end
-
-function BST:GetViewerNamesRaw()
-	self:EnsureInit()
-	local db = self:GetActiveDB()
-	if not db then return {} end
-	EnsureTables(db)
-	local t = {}
-	for vn in pairs(db.knownViewers) do t[#t + 1] = vn end
-	return t
-end
-
--- ---------- Per viewer settings ----------
 
 function BST:IsSwipeEnabled(vn)
 	self:EnsureInit()
@@ -210,121 +272,495 @@ function BST:IsSwipeEnabled(vn)
 	return not not db.swipe[vn]
 end
 
+function BST:GetDurationPos(vn)
+	self:EnsureInit()
+	local db = self:GetActiveDB(); if not db then return "CENTER", 0, 0 end
+	EnsureTables(db); self:EnsureViewerDefaults(vn)
+	local p = db.durationPos[vn]
+	return SafeAnchor(p.anchor), tonumber(p.x) or 0, tonumber(p.y) or 0
+end
+
+function BST:GetStackPos(vn)
+	self:EnsureInit()
+	local db = self:GetActiveDB(); if not db then return "BOTTOMRIGHT", 0, 0 end
+	EnsureTables(db); self:EnsureViewerDefaults(vn)
+	local p = db.stackPos[vn]
+	return SafeAnchor(p.anchor), tonumber(p.x) or 0, tonumber(p.y) or 0
+end
+
+function BST:SetDurationPos(vn, anchor, x, y)
+	self:EnsureInit()
+	local db = self:GetActiveDB(); if not db then return end
+	EnsureTables(db); self:EnsureViewerDefaults(vn)
+	local p = db.durationPos[vn]
+	anchor = SafeAnchor(anchor)
+	x = tonumber(x) or 0
+	y = tonumber(y) or 0
+	if p.anchor == anchor and p.x == x and p.y == y then return end
+	p.anchor, p.x, p.y = anchor, x, y
+	self:ApplyViewerCooldowns(vn)
+	self:RefreshConfig()
+end
+
+function BST:SetStackPos(vn, anchor, x, y)
+	self:EnsureInit()
+	local db = self:GetActiveDB(); if not db then return end
+	EnsureTables(db); self:EnsureViewerDefaults(vn)
+	local p = db.stackPos[vn]
+	anchor = SafeAnchor(anchor)
+	x = tonumber(x) or 0
+	y = tonumber(y) or 0
+	if p.anchor == anchor and p.x == x and p.y == y then return end
+	p.anchor, p.x, p.y = anchor, x, y
+	self:ApplyViewerCooldowns(vn)
+	self:RefreshConfig()
+end
+
+function BST:ResetDurationPos(vn) self:SetDurationPos(vn, "CENTER", 0, 0) end
+function BST:ResetStackPos(vn) self:SetStackPos(vn, "BOTTOMRIGHT", 0, 0) end
+
+function BST:SetUseCharacterSettings(flag)
+	self:EnsureInit()
+	local c = self:GetCharDB()
+	if not c then return end
+	c.useCharacterSettings = not not flag
+
+	if c.useCharacterSettings then
+		local a = self:GetAccountDB()
+		EnsureTables(a); EnsureTables(c)
+		if c.defaultNewViewerSwipe == nil then c.defaultNewViewerSwipe = a.defaultNewViewerSwipe end
+		if c.minimap.show == nil then c.minimap.show = a.minimap.show end
+		if c.minimap.angle == nil then c.minimap.angle = a.minimap.angle end
+		if c.ui.compact == nil then c.ui.compact = a.ui.compact end
+		if c.ui.selectedViewer == nil then c.ui.selectedViewer = a.ui.selectedViewer end
+	end
+
+	self:UpdateMinimapButton()
+	self:RefreshConfig()
+	self:ApplyAllKnownCooldowns()
+end
+
 function BST:SetSwipeEnabled(vn, flag)
 	self:EnsureInit()
 	local db = self:GetActiveDB()
-	if not db then return end
 	EnsureTables(db)
 	self:EnsureViewerDefaults(vn)
-	db.swipe[vn] = not not flag
-	self:RefreshAll()
+
+	local newVal = not not flag
+	if db.swipe[vn] == newVal then
+		self:RefreshConfig()
+		return
+	end
+
+	db.swipe[vn] = newVal
+	self:ApplyViewerCooldowns(vn)
 	self:RefreshConfig()
 end
-
-function BST:GetTextPos(vn)
-	self:EnsureInit()
-	local db = self:GetActiveDB()
-	if not db then return 0, 0 end
-	EnsureTables(db)
-	self:EnsureViewerDefaults(vn)
-	local p = db.textPos[vn]
-	return tonumber(p.x) or 0, tonumber(p.y) or 0
-end
-
-function BST:SetTextPos(vn, x, y)
-	self:EnsureInit()
-	local db = self:GetActiveDB()
-	if not db then return end
-	EnsureTables(db)
-	self:EnsureViewerDefaults(vn)
-	db.textPos[vn].x = tonumber(x) or 0
-	db.textPos[vn].y = tonumber(y) or 0
-	self:RefreshAll()
-	self:RefreshConfig()
-end
-
-function BST:ResetTextPos(vn) self:SetTextPos(vn, 0, 0) end
 
 function BST:SetAllSwipe(flag)
-	self:DiscoverViewers()
+	self:EnsureInit()
 	local db = self:GetActiveDB()
 	EnsureTables(db)
-	for _, vn in ipairs(self:GetViewerNamesRaw()) do
+
+	local val = not not flag
+	for vn in pairs(db.knownViewers) do
 		self:EnsureViewerDefaults(vn)
-		db.swipe[vn] = not not flag
+		db.swipe[vn] = val
 	end
-	self:RefreshAll()
+
+	self:ApplyAllKnownCooldowns()
 	self:RefreshConfig()
 end
 
-function BST:ResetAllTextOffsets()
-	self:DiscoverViewers()
-	local db = self:GetActiveDB()
-	EnsureTables(db)
-	for _, vn in ipairs(self:GetViewerNamesRaw()) do
+function BST:ResetAllOffsets()
+	self:EnsureInit()
+	local db = self:GetActiveDB(); EnsureTables(db)
+	for vn in pairs(db.knownViewers) do
 		self:EnsureViewerDefaults(vn)
-		db.textPos[vn].x = 0
-		db.textPos[vn].y = 0
+		db.durationPos[vn].anchor, db.durationPos[vn].x, db.durationPos[vn].y = "CENTER", 0, 0
+		db.stackPos[vn].anchor, db.stackPos[vn].x, db.stackPos[vn].y = "BOTTOMRIGHT", 0, 0
 	end
-	self:RefreshAll()
+	self:ApplyAllKnownCooldowns()
 	self:RefreshConfig()
 end
 
--- ---------- Apply swipe + text pos ----------
+-- -------------------------------------------------------
+-- Viewer discovery
+-- -------------------------------------------------------
 
-local function FindViewerNameFromRegion(region)
-	local p = region
-	for _ = 1, 10 do
-		if not p then break end
-		if p.viewerFrame and IsFrame(p.viewerFrame) and type(p.viewerFrame.GetName) == "function" then
-			local vn = p.viewerFrame:GetName()
-			if vn then return vn end
+function BST:DiscoverViewersCheap()
+	self:EnsureInit()
+	local db = self:GetActiveDB()
+	EnsureTables(db)
+
+	for _, name in ipairs({ "BuffIconCooldownViewer", "EssentialCooldownViewer", "UtilityCooldownViewer" }) do
+		if _G[name] and IsFrame(_G[name]) then
+			self:EnsureViewerDefaults(name)
+			self:MarkSeen(name)
 		end
+	end
+
+	for k, v in pairs(_G) do
+		if type(k) == "string" and k:match("CooldownViewer$") and IsFrame(v) then
+			self:EnsureViewerDefaults(k)
+			self:MarkSeen(k)
+		end
+	end
+end
+
+function BST:GetViewerNamesRaw()
+	self:EnsureInit()
+	local db = self:GetActiveDB()
+	EnsureTables(db)
+	local t = {}
+	for vn in pairs(db.knownViewers) do t[#t + 1] = vn end
+	return t
+end
+
+function BST:GetSortedViewerNames()
+	self:DiscoverViewersCheap()
+	local names = self:GetViewerNamesRaw()
+	table.sort(names)
+	return names
+end
+
+-- -------------------------------------------------------
+-- Resolve viewer from chain
+-- -------------------------------------------------------
+
+local function ResolveViewerNameFromChain(start, db)
+	local p = start
+	for _ = 1, 14 do
+		if not p then break end
+
+		local vf = rawget(p, "viewerFrame")
+		if vf and IsFrame(vf) and type(vf.GetName) == "function" then
+			local vn = vf:GetName()
+			if vn and vn ~= "" then return vn end
+		end
+
+		for _, key in ipairs({ "cooldownViewer", "CooldownViewer", "viewer", "Viewer" }) do
+			local ref = rawget(p, key)
+			if ref and IsFrame(ref) and type(ref.GetName) == "function" then
+				local vn = ref:GetName()
+				if vn and vn ~= "" then return vn end
+			end
+		end
+
+		if type(p.GetName) == "function" then
+			local name = p:GetName()
+			if name and name ~= "" then
+				if db and db.knownViewers and db.knownViewers[name] then
+					return name
+				end
+				if name:match("CooldownViewer$") and _G[name] and IsFrame(_G[name]) then
+					return name
+				end
+			end
+		end
+
 		p = (type(p.GetParent) == "function") and p:GetParent() or nil
 	end
 	return nil
 end
 
-local function IsFontString(o)
-	return type(o) == "table" and type(o.GetObjectType) == "function" and o:GetObjectType() == "FontString"
+function BST:_TrackCooldown(cooldown, vn)
+	if not cooldown or not vn or vn == "" then return end
+	self._viewerByCooldown[cooldown] = vn
+	self:EnsureViewerDefaults(vn)
+	self._cooldownsByViewer[vn][cooldown] = true
 end
 
-function BST:FindCooldownCountdownText(cooldown)
-	if not cooldown then return nil end
-	if IsFontString(cooldown.text) then return cooldown.text end
-	if IsFontString(cooldown.Text) then return cooldown.Text end
-	if IsFontString(cooldown.CountdownText) then return cooldown.CountdownText end
-	if IsFontString(cooldown.CooldownText) then return cooldown.CooldownText end
+-- -------------------------------------------------------
+-- Find duration / stacks FontStrings
+-- -------------------------------------------------------
 
-	if type(cooldown.GetRegions) == "function" then
-		local regions = { cooldown:GetRegions() }
-		for i = 1, #regions do
-			if IsFontString(regions[i]) then return regions[i] end
+local function CollectFontStrings(frame, out)
+	if not frame or type(frame.GetRegions) ~= "function" then return end
+	local regions = { frame:GetRegions() }
+	for i = 1, #regions do
+		local r = regions[i]
+		if IsFontString(r) then out[#out + 1] = r end
+	end
+end
+
+local function FontSize(fs)
+	local _, size = fs.GetFont and fs:GetFont()
+	return tonumber(size) or 0
+end
+
+local function PointName(fs)
+	local p = SafeGetPoint(fs)
+	return SafeToString(p)
+end
+
+function BST:FindDurationText(cooldown)
+	local candidates = {}
+	local parent = (type(cooldown.GetParent) == "function") and cooldown:GetParent() or nil
+	local gp = (parent and type(parent.GetParent) == "function") and parent:GetParent() or nil
+
+	CollectFontStrings(cooldown, candidates)
+	CollectFontStrings(parent, candidates)
+	CollectFontStrings(gp, candidates)
+
+	for _, k in ipairs({ "text", "Text", "CountdownText", "CooldownText", "TimerText" }) do
+		local fs = rawget(cooldown, k)
+		if IsFontString(fs) then candidates[#candidates + 1] = fs end
+	end
+
+	local seen, best, bestScore = {}, nil, -1
+	for i = 1, #candidates do
+		local fs = candidates[i]
+		if fs and not seen[fs] then
+			seen[fs] = true
+			local txt = fs.GetText and fs:GetText() or nil
+			local size = FontSize(fs)
+			local pName = PointName(fs)
+
+			local score = 0
+			if IsNumericText(txt) then score = score + 100 end
+			score = score + (size * 3)
+			if pName:find("CENTER") then score = score + 25 end
+			if pName:find("TOP") then score = score + 10 end
+			if pName:find("BOTTOMRIGHT") then score = score - 35 end
+
+			local _, rel = SafeGetPoint(fs)
+			if rel and SafeEq(rel, cooldown) then score = score + 25 end
+
+			if score > bestScore then best, bestScore = fs, score end
 		end
 	end
-	return nil
+	return best
 end
+
+function BST:FindStackText(cooldown, durationFS)
+	local candidates = {}
+	local parent = (type(cooldown.GetParent) == "function") and cooldown:GetParent() or nil
+	local gp = (parent and type(parent.GetParent) == "function") and parent:GetParent() or nil
+
+	CollectFontStrings(cooldown, candidates)
+	CollectFontStrings(parent, candidates)
+	CollectFontStrings(gp, candidates)
+
+	if parent then
+		for _, k in ipairs({ "count", "Count", "stack", "Stack", "Stacks", "ChargeText" }) do
+			local fs = rawget(parent, k)
+			if IsFontString(fs) then candidates[#candidates + 1] = fs end
+		end
+	end
+
+	local seen, best, bestScore = {}, nil, -1
+	for i = 1, #candidates do
+		local fs = candidates[i]
+		if fs and fs ~= durationFS and not seen[fs] then
+			seen[fs] = true
+
+			local txt = fs.GetText and fs:GetText() or nil
+			local size = FontSize(fs)
+			local pName = PointName(fs)
+
+			local score = 0
+			if IsNumericText(txt) then score = score + 100 end
+			score = score - (size * 2)
+
+			if pName:find("BOTTOMRIGHT") then score = score + 40 end
+			if pName:find("BOTTOM") then score = score + 15 end
+			if pName:find("RIGHT") then score = score + 10 end
+			if pName:find("CENTER") then score = score - 10 end
+			if pName:find("TOP") then score = score - 20 end
+
+			local _, rel = SafeGetPoint(fs)
+			if rel and parent and SafeEq(rel, parent) then score = score + 15 end
+			if rel and SafeEq(rel, cooldown) then score = score + 10 end
+
+			if score > bestScore then best, bestScore = fs, score end
+		end
+	end
+	return best
+end
+
+-- -------------------------------------------------------
+-- Enforcers
+-- -------------------------------------------------------
+
+function BST:_EnsureSwipeEnforcer(cooldown)
+	if cooldown._bstSwipeHooked then return end
+	if type(cooldown.SetDrawSwipe) ~= "function" then return end
+	cooldown._bstSwipeHooked = true
+
+	hooksecurefunc(cooldown, "SetDrawSwipe", function(cd, val)
+		if cd._bstSwipeGuard then return end
+		local db = BST:GetActiveDB(); EnsureTables(db)
+		local vn = BST._viewerByCooldown[cd] or ResolveViewerNameFromChain(cd, db)
+		if not vn then return end
+
+		BST:EnsureViewerDefaults(vn)
+		local desired = BST:IsSwipeEnabled(vn)
+
+		if val ~= desired then
+			cd._bstSwipeGuard = true
+			pcall(cd.SetDrawSwipe, cd, desired)
+			cd._bstSwipeGuard = false
+		end
+	end)
+end
+
+-- Secret-safe "already positioned?" check (no direct == on GetPoint returns)
+local function IsFSAtDesired(fs, cooldown, anchor, x, y)
+	local pWant, rpWant, dxWant, dyWant = GetDesiredPoint(anchor, x, y)
+	local p, rel, rp, ox, oy = SafeGetPoint(fs)
+	if p == nil then return false end
+
+	-- rel compare can be done safely
+	if not SafeEq(rel, cooldown) then return false end
+
+	-- p/rp may be secret strings: SafeEq handles that
+	if not SafeEq(p, pWant) then return false end
+	if not SafeEq(rp, rpWant) then return false end
+
+	-- ox/oy may be secret numeric: SafeNum handles that
+	if SafeNum(ox) ~= dxWant then return false end
+	if SafeNum(oy) ~= dyWant then return false end
+
+	return true
+end
+
+function BST:_EnsureTextEnforcer(cooldown, fs, which)
+	if not cooldown or not fs or not IsFontString(fs) then return end
+	if fs._bstTextHooked and fs._bstHookWhich == which and fs._bstHookCooldown == cooldown then
+		return
+	end
+
+	fs._bstTextHooked = true
+	fs._bstHookWhich = which
+	fs._bstHookCooldown = cooldown
+
+	hooksecurefunc(fs, "SetPoint", function(font)
+		-- Still avoid enforcement in combat (safe + prevents taint/blocked ops)
+		if type(InCombatLockdown) == "function" and InCombatLockdown() then return end
+
+		if font._bstTextGuard then return end
+		if font._bstHookCooldown ~= cooldown then return end
+		if font._bstHookWhich ~= which then return end
+
+		local db = BST:GetActiveDB(); EnsureTables(db)
+		local vn = BST._viewerByCooldown[cooldown] or ResolveViewerNameFromChain(cooldown, db)
+		if not vn then return end
+
+		local a, x2, y2
+		if which == "duration" then
+			a, x2, y2 = BST:GetDurationPos(vn)
+		else
+			a, x2, y2 = BST:GetStackPos(vn)
+		end
+
+		if IsFSAtDesired(font, cooldown, a, x2, y2) then return end
+
+		font._bstTextGuard = true
+		pcall(ApplyFS, font, cooldown, a, x2, y2)
+		font._bstTextGuard = false
+	end)
+end
+
+-- -------------------------------------------------------
+-- Apply to cooldowns
+-- -------------------------------------------------------
 
 function BST:ApplyToCooldown(cooldown, viewerName)
 	if not cooldown or type(cooldown.SetDrawSwipe) ~= "function" then return end
-	if not viewerName then viewerName = FindViewerNameFromRegion(cooldown) end
-	if not viewerName then return end
 
-	self:EnsureViewerDefaults(viewerName)
-	self:MarkSeen(viewerName)
+	self:EnsureInit()
+	local db = self:GetActiveDB()
+	EnsureTables(db)
 
-	cooldown:SetDrawSwipe(self:IsSwipeEnabled(viewerName))
+	local vn = viewerName or self._viewerByCooldown[cooldown] or ResolveViewerNameFromChain(cooldown, db)
+	if not vn then return end
 
-	local fs = self:FindCooldownCountdownText(cooldown)
-	if fs then
-		local x, y = self:GetTextPos(viewerName)
-		fs:ClearAllPoints()
-		fs:SetPoint("CENTER", cooldown, "CENTER", x, y)
+	self:EnsureViewerDefaults(vn)
+	self:MarkSeen(vn)
+	self:_TrackCooldown(cooldown, vn)
+
+	local st = self._appliedByCooldown[cooldown]
+	if not st then st = {}; self._appliedByCooldown[cooldown] = st end
+
+	-- Swipe always enforced (even in combat)
+	self:_EnsureSwipeEnforcer(cooldown)
+	local desiredSwipe = self:IsSwipeEnabled(vn)
+	if st.swipe ~= desiredSwipe then
+		cooldown._bstSwipeGuard = true
+		pcall(cooldown.SetDrawSwipe, cooldown, desiredSwipe)
+		cooldown._bstSwipeGuard = false
+		st.swipe = desiredSwipe
+	end
+
+	-- If in combat: do not reposition duration/stacks
+	local inCombat = (type(InCombatLockdown) == "function") and InCombatLockdown()
+	if inCombat then return end
+
+	-- Duration
+	local durA, durX, durY = self:GetDurationPos(vn)
+	local durFS = st.durFS
+	if not (durFS and IsFontString(durFS)) then
+		durFS = self:FindDurationText(cooldown)
+	end
+	if durFS then
+		self:_EnsureTextEnforcer(cooldown, durFS, "duration")
+		if st.durFS ~= durFS or st.durA ~= durA or st.durX ~= durX or st.durY ~= durY or not IsFSAtDesired(durFS, cooldown, durA, durX, durY) then
+			durFS._bstTextGuard = true
+			pcall(ApplyFS, durFS, cooldown, durA, durX, durY)
+			durFS._bstTextGuard = false
+			st.durFS, st.durA, st.durX, st.durY = durFS, durA, durX, durY
+		end
+	end
+
+	-- Stacks
+	local stkA, stkX, stkY = self:GetStackPos(vn)
+	local stkFS = st.stkFS
+	if not (stkFS and IsFontString(stkFS)) then
+		stkFS = self:FindStackText(cooldown, durFS)
+	end
+	if stkFS then
+		self:_EnsureTextEnforcer(cooldown, stkFS, "stack")
+		if st.stkFS ~= stkFS or st.stkA ~= stkA or st.stkX ~= stkX or st.stkY ~= stkY or not IsFSAtDesired(stkFS, cooldown, stkA, stkX, stkY) then
+			stkFS._bstTextGuard = true
+			pcall(ApplyFS, stkFS, cooldown, stkA, stkX, stkY)
+			stkFS._bstTextGuard = false
+			st.stkFS, st.stkA, st.stkX, st.stkY = stkFS, stkA, stkX, stkY
+		end
 	end
 end
 
+function BST:ApplyViewerCooldowns(vn)
+	if not vn or vn == "" then return end
+	self:EnsureViewerDefaults(vn)
+	local set = self._cooldownsByViewer[vn]
+	if not set then return end
+	for cd in pairs(set) do
+		self:ApplyToCooldown(cd, vn)
+	end
+end
+
+function BST:ApplyAllKnownCooldowns()
+	for vn, set in pairs(self._cooldownsByViewer) do
+		if set then
+			for cd in pairs(set) do
+				self:ApplyToCooldown(cd, vn)
+			end
+		end
+	end
+end
+
+-- -------------------------------------------------------
+-- Scanning / hooking
+-- -------------------------------------------------------
+
 function BST:ApplyToExistingFrames()
-	self:DiscoverViewers()
+	local now = GetTime()
+	if (now - (self._lastFullScan or 0)) < 0.25 then return end
+	self._lastFullScan = now
+
+	self:DiscoverViewersCheap()
+
 	local f = EnumerateFrames()
 	while f do
 		if f.viewerFrame and IsFrame(f.viewerFrame) and f.Cooldown and type(f.Cooldown.SetDrawSwipe) == "function" then
@@ -338,35 +774,45 @@ function BST:ApplyToExistingFrames()
 	end
 end
 
-function BST:Apply() self:ApplyToExistingFrames() end
+function BST:RequestFullScan()
+	if self._fullScanPending then return end
+	self._fullScanPending = true
+	C_Timer.After(0.05, function()
+		BST._fullScanPending = false
+		BST:ApplyToExistingFrames()
+		BST:RefreshConfig()
+	end)
+end
 
-function BST:ScheduleApplyRetries()
-	local tries = 0
-	local function tick()
-		tries = tries + 1
-		BST:Apply()
-		if tries < 10 then C_Timer.After(0.6, tick) end
+function BST:TryHookCooldownSetters()
+	if self._hookedCooldownSetters then return end
+	self._hookedCooldownSetters = true
+
+	local function OnCooldownTouched(cooldown)
+		SafeCall(function() BST:ApplyToCooldown(cooldown, nil) end)
 	end
-	tick()
+
+	if type(_G.CooldownFrame_Set) == "function" then hooksecurefunc("CooldownFrame_Set", OnCooldownTouched) end
+	if type(_G.CooldownFrame_SetTimer) == "function" then hooksecurefunc("CooldownFrame_SetTimer", OnCooldownTouched) end
+	if type(_G.CooldownFrame_SetCooldown) == "function" then hooksecurefunc("CooldownFrame_SetCooldown", OnCooldownTouched) end
+
+	for _, mixinName in ipairs({ "CooldownFrameMixin", "CooldownMixin" }) do
+		local mix = _G[mixinName]
+		if type(mix) == "table" then
+			if type(mix.SetCooldown) == "function" then
+				hooksecurefunc(mix, "SetCooldown", function(self) OnCooldownTouched(self) end)
+			end
+			if type(mix.SetTimer) == "function" then
+				hooksecurefunc(mix, "SetTimer", function(self) OnCooldownTouched(self) end)
+			end
+		end
+	end
 end
 
-function BST:TryHookCooldownFrameSet()
-	if self._hookedCooldownFrameSet then return end
-	if type(_G.CooldownFrame_Set) ~= "function" then return end
-	hooksecurefunc("CooldownFrame_Set", function(cooldown) BST:ApplyToCooldown(cooldown, nil) end)
-	self._hookedCooldownFrameSet = true
-end
-
--- ---------- UI helpers ----------
-
-local function ClampInt(n, lo, hi)
-	n = tonumber(n)
-	if not n then return 0 end
-	n = math.floor(n + 0.5)
-	if n < lo then n = lo end
-	if n > hi then n = hi end
-	return n
-end
+-- -------------------------------------------------------
+-- UI styling helpers
+-- (UNCHANGED from your working build)
+-- -------------------------------------------------------
 
 local function MakeLabel(parent, text, template)
 	local fs = parent:CreateFontString(nil, "OVERLAY", template or "GameFontNormalSmall")
@@ -416,28 +862,23 @@ local function Border2px(frame)
 	if frame._bstBorder then return end
 	frame._bstBorder = true
 	local border = 2
-
 	local function mk()
 		local x = frame:CreateTexture(nil, "BORDER")
 		x:SetColorTexture(0, 0, 0, 1)
 		return x
 	end
-
 	local top = mk()
 	top:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
 	top:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, 0)
 	top:SetHeight(border)
-
 	local bottom = mk()
 	bottom:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, 0)
 	bottom:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
 	bottom:SetHeight(border)
-
 	local left = mk()
 	left:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
 	left:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 0, 0)
 	left:SetWidth(border)
-
 	local right = mk()
 	right:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 0, 0)
 	right:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
@@ -448,11 +889,9 @@ local function FillOnly(frame, bg)
 	if frame._bstFill then return end
 	frame._bstFill = true
 	local bgc = bg or { 0.22, 0.22, 0.22, 1.0 }
-
 	local t = frame:CreateTexture(nil, "BACKGROUND")
 	t:SetAllPoints()
 	t:SetColorTexture(bgc[1], bgc[2], bgc[3], bgc[4])
-
 	local shade = frame:CreateTexture(nil, "BACKGROUND")
 	shade:SetAllPoints()
 	shade:SetColorTexture(0, 0, 0, 0.06)
@@ -503,25 +942,25 @@ local function StyleGreyButton(btn)
 
 	local fs = btn.GetFontString and btn:GetFontString()
 	if fs then fs:SetTextColor(1, 1, 1) end
-
-	btn:HookScript("OnEnable", function(b)
-		local fss = b.GetFontString and b:GetFontString()
-		if fss then fss:SetTextColor(1, 1, 1) end
-	end)
-	btn:HookScript("OnDisable", function(b)
-		local fss = b.GetFontString and b:GetFontString()
-		if fss then fss:SetTextColor(0.65, 0.65, 0.65) end
-	end)
 end
 
--- ---------- Config window ----------
+local function CreateAnchorDropdown(parent, width)
+	local dd = CreateFrame("Frame", nil, parent, "UIDropDownMenuTemplate")
+	UIDropDownMenu_SetWidth(dd, width or 140)
+	UIDropDownMenu_JustifyText(dd, "LEFT")
+	return dd
+end
+
+-- -------------------------------------------------------
+-- Config UI (same layout you had working)
+-- -------------------------------------------------------
 
 function BST:BuildConfigWindow()
 	if self.configFrame then return end
 	self:EnsureInit()
 
 	local f = CreateFrame("Frame", "BuffSwipeToggleFrame", UIParent)
-	f:SetSize(840, 570)
+	f:SetSize(920, 570)
 	f:SetPoint("CENTER")
 	f:SetFrameStrata("DIALOG")
 	f:SetToplevel(true)
@@ -532,7 +971,19 @@ function BST:BuildConfigWindow()
 
 	SkinCell(f, { 0.20, 0.20, 0.20, 1.0 }, true)
 
-	-- Titlebar (fill only + bottom separator)
+	-- ESC closes it
+	do
+		local fname = f:GetName()
+		if fname and type(UISpecialFrames) == "table" then
+			local exists = false
+			for i = 1, #UISpecialFrames do
+				if UISpecialFrames[i] == fname then exists = true break end
+			end
+			if not exists then tinsert(UISpecialFrames, fname) end
+		end
+	end
+
+	-- Titlebar
 	local titleBar = CreateFrame("Frame", nil, f)
 	titleBar:SetPoint("TOPLEFT", f, "TOPLEFT", 2, -2)
 	titleBar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
@@ -550,7 +1001,6 @@ function BST:BuildConfigWindow()
 	titleText:SetPoint("CENTER", titleBar, "CENTER", 0, 0)
 	titleText:SetText("Buff Swipe Toggle")
 
-	-- Close button
 	local closeBtn = CreateFrame("Button", nil, titleBar, "UIPanelButtonTemplate")
 	closeBtn:SetSize(24, 20)
 	closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
@@ -558,7 +1008,6 @@ function BST:BuildConfigWindow()
 	StyleGreyButton(closeBtn)
 	closeBtn:SetScript("OnClick", function() f:Hide() end)
 
-	-- Minimap label + checkbox
 	local mmLabel = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	mmLabel:SetPoint("RIGHT", closeBtn, "LEFT", -10, 0)
 	mmLabel:SetText("Minimap")
@@ -587,7 +1036,7 @@ function BST:BuildConfigWindow()
 	local leftPane = CreateFrame("Frame", nil, container)
 	leftPane:SetPoint("TOPLEFT", container, "TOPLEFT", 10, -10)
 	leftPane:SetPoint("BOTTOMLEFT", container, "BOTTOMLEFT", 10, 10)
-	leftPane:SetWidth(300)
+	leftPane:SetWidth(320)
 	SkinCell(leftPane, { 0.20, 0.20, 0.20, 1.0 })
 
 	-- Right pane
@@ -608,8 +1057,8 @@ function BST:BuildConfigWindow()
 	-- Left list cell
 	local leftListCell = CreateFrame("Frame", nil, leftPane)
 	leftListCell:SetPoint("TOPLEFT", leftHeader, "BOTTOMLEFT", 0, -10)
-	leftListCell:SetPoint("TOPRIGHT", leftPane, "TOPRIGHT", -12, -52)
 	leftListCell:SetPoint("BOTTOMLEFT", leftPane, "BOTTOMLEFT", 12, 40)
+	leftListCell:SetPoint("TOPRIGHT", leftPane, "TOPRIGHT", -12, -52)
 	leftListCell:SetPoint("BOTTOMRIGHT", leftPane, "BOTTOMRIGHT", -12, 40)
 	SkinCell(leftListCell, { 0.16, 0.16, 0.16, 1.0 })
 
@@ -691,34 +1140,75 @@ function BST:BuildConfigWindow()
 
 	local swipeCB = CreateCheck(viewerCell, "Enable swipe", "TOPLEFT", viewerCell, 12, -64, 220)
 
-	local row = CreateFrame("Frame", nil, viewerCell)
-	row:SetPoint("TOPLEFT", viewerCell, "TOPLEFT", 12, -92)
-	row:SetPoint("TOPRIGHT", viewerCell, "TOPRIGHT", -12, -92)
-	row:SetHeight(26)
+	-- Duration
+	local durHeader = MakeLabel(viewerCell, "Duration", "GameFontNormalSmall")
+	durHeader:SetPoint("TOPLEFT", viewerCell, "TOPLEFT", 12, -96)
 
-	local xLabel = MakeLabel(row, "Text X:", "GameFontNormalSmall")
-	xLabel:SetPoint("LEFT", row, "LEFT", 0, 0)
-	local xBox = MakeNumberBox(row, 70)
-	xBox:SetPoint("LEFT", xLabel, "RIGHT", 8, 0)
+	local durRow = CreateFrame("Frame", nil, viewerCell)
+	durRow:SetPoint("TOPLEFT", viewerCell, "TOPLEFT", 12, -114)
+	durRow:SetPoint("TOPRIGHT", viewerCell, "TOPRIGHT", -12, -114)
+	durRow:SetHeight(32)
 
-	local yLabel = MakeLabel(row, "Text Y:", "GameFontNormalSmall")
-	yLabel:SetPoint("LEFT", xBox, "RIGHT", 18, 0)
-	local yBox = MakeNumberBox(row, 70)
-	yBox:SetPoint("LEFT", yLabel, "RIGHT", 8, 0)
+	local durAnchorLabel = MakeLabel(durRow, "Anchor:", "GameFontNormalSmall")
+	durAnchorLabel:SetPoint("LEFT", durRow, "LEFT", 0, 0)
 
-	local resetViewerBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-	resetViewerBtn:SetSize(90, 22)
-	resetViewerBtn:SetPoint("LEFT", yBox, "RIGHT", 18, 0)
-	resetViewerBtn:SetText("Reset")
-	StyleGreyButton(resetViewerBtn)
+	local durAnchorDD = CreateAnchorDropdown(durRow, 140)
+	durAnchorDD:SetPoint("LEFT", durAnchorLabel, "RIGHT", -10, -2)
+
+	local durXLabel = MakeLabel(durRow, "X:", "GameFontNormalSmall")
+	durXLabel:SetPoint("LEFT", durAnchorDD, "RIGHT", -2, 0)
+	local durXBox = MakeNumberBox(durRow, 56)
+	durXBox:SetPoint("LEFT", durXLabel, "RIGHT", 6, 0)
+
+	local durYLabel = MakeLabel(durRow, "Y:", "GameFontNormalSmall")
+	durYLabel:SetPoint("LEFT", durXBox, "RIGHT", 10, 0)
+	local durYBox = MakeNumberBox(durRow, 56)
+	durYBox:SetPoint("LEFT", durYLabel, "RIGHT", 6, 0)
+
+	local durResetBtn = CreateFrame("Button", nil, durRow, "UIPanelButtonTemplate")
+	durResetBtn:SetSize(80, 22)
+	durResetBtn:SetPoint("LEFT", durYBox, "RIGHT", 12, 0)
+	durResetBtn:SetText("Reset")
+	StyleGreyButton(durResetBtn)
+
+	-- Stacks
+	local stkHeader = MakeLabel(viewerCell, "Stacks", "GameFontNormalSmall")
+	stkHeader:SetPoint("TOPLEFT", durRow, "BOTTOMLEFT", 0, -14)
+
+	local stkRow = CreateFrame("Frame", nil, viewerCell)
+	stkRow:SetPoint("TOPLEFT", stkHeader, "BOTTOMLEFT", 0, -6)
+	stkRow:SetPoint("TOPRIGHT", viewerCell, "TOPRIGHT", -12, -166)
+	stkRow:SetHeight(32)
+
+	local stkAnchorLabel = MakeLabel(stkRow, "Anchor:", "GameFontNormalSmall")
+	stkAnchorLabel:SetPoint("LEFT", stkRow, "LEFT", 0, 0)
+
+	local stkAnchorDD = CreateAnchorDropdown(stkRow, 140)
+	stkAnchorDD:SetPoint("LEFT", stkAnchorLabel, "RIGHT", -10, -2)
+
+	local stkXLabel = MakeLabel(stkRow, "X:", "GameFontNormalSmall")
+	stkXLabel:SetPoint("LEFT", stkAnchorDD, "RIGHT", -2, 0)
+	local stkXBox = MakeNumberBox(stkRow, 56)
+	stkXBox:SetPoint("LEFT", stkXLabel, "RIGHT", 6, 0)
+
+	local stkYLabel = MakeLabel(stkRow, "Y:", "GameFontNormalSmall")
+	stkYLabel:SetPoint("LEFT", stkXBox, "RIGHT", 10, 0)
+	local stkYBox = MakeNumberBox(stkRow, 56)
+	stkYBox:SetPoint("LEFT", stkYLabel, "RIGHT", 6, 0)
+
+	local stkResetBtn = CreateFrame("Button", nil, stkRow, "UIPanelButtonTemplate")
+	stkResetBtn:SetSize(80, 22)
+	stkResetBtn:SetPoint("LEFT", stkYBox, "RIGHT", 12, 0)
+	stkResetBtn:SetText("Reset")
+	StyleGreyButton(stkResetBtn)
 
 	local hint = viewerCell:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	hint:SetPoint("TOPLEFT", row, "BOTTOMLEFT", 0, -10)
+	hint:SetPoint("TOPLEFT", stkRow, "BOTTOMLEFT", 0, -10)
 	hint:SetPoint("TOPRIGHT", viewerCell, "TOPRIGHT", -12, 0)
 	hint:SetJustifyH("LEFT")
-	hint:SetText("Tip: Change X/Y then press Enter or click away. Viewer list shows swipe state on the left.")
+	hint:SetText("Tip: Change Anchor/X/Y then press Enter or click away. Edge Top/Bottom puts the TEXT CENTER on the icon edge line. (Offsets apply out of combat if restricted.)")
 
-	-- BOTTOM BUTTONS (centered group layout) - FIXED (no self-anchoring)
+	-- Bottom buttons
 	local enableAllBtn = CreateFrame("Button", nil, buttonsCell, "UIPanelButtonTemplate")
 	enableAllBtn:SetText("Enable all")
 	StyleGreyButton(enableAllBtn)
@@ -728,25 +1218,21 @@ function BST:BuildConfigWindow()
 	StyleGreyButton(disableAllBtn)
 
 	local resetAllBtn = CreateFrame("Button", nil, buttonsCell, "UIPanelButtonTemplate")
-	resetAllBtn:SetText("Reset all X/Y")
+	resetAllBtn:SetText("Reset all offsets")
 	StyleGreyButton(resetAllBtn)
 
 	local function LayoutBottomButtons()
 		local w = buttonsCell:GetWidth() or 0
 		if w <= 0 then return end
+		local gap, bh, inset = 12, 20, 12
 
-		local gap = 12
-		local bh = 20
-		local yOff = 0
-		local minSideInset = 12
-
-		local bw = math.floor((w - (minSideInset * 2) - (gap * 2)) / 3)
-		if bw > 125 then bw = 125 end
-		if bw < 75 then bw = 75 end
+		local bw = math.floor((w - (inset * 2) - (gap * 2)) / 3)
+		if bw > 150 then bw = 150 end
+		if bw < 90 then bw = 90 end
 
 		local groupW = (bw * 3) + (gap * 2)
 		local startX = math.floor((w - groupW) / 2)
-		if startX < minSideInset then startX = minSideInset end
+		if startX < inset then startX = inset end
 
 		enableAllBtn:SetSize(bw, bh)
 		disableAllBtn:SetSize(bw, bh)
@@ -756,33 +1242,37 @@ function BST:BuildConfigWindow()
 		disableAllBtn:ClearAllPoints()
 		resetAllBtn:ClearAllPoints()
 
-		enableAllBtn:SetPoint("LEFT", buttonsCell, "LEFT", startX, yOff)
+		enableAllBtn:SetPoint("LEFT", buttonsCell, "LEFT", startX, 0)
 		disableAllBtn:SetPoint("LEFT", enableAllBtn, "RIGHT", gap, 0)
 		resetAllBtn:SetPoint("LEFT", disableAllBtn, "RIGHT", gap, 0)
 	end
-
 	buttonsCell:SetScript("OnSizeChanged", LayoutBottomButtons)
 	C_Timer.After(0, LayoutBottomButtons)
 
+	-- Save UI refs
 	self.configFrame = f
 	self.ui = {
 		mmCheck = mmCheck,
-
 		status = status,
 		listScroll = listScroll,
 		listContent = listContent,
 		listButtons = {},
-
 		useChar = useChar,
 		defaultNew = defaultNew,
 		compact = compactCB,
 		refreshBtn = refreshBtn,
-
 		selName = selName,
 		swipeCB = swipeCB,
-		xBox = xBox,
-		yBox = yBox,
-		resetViewerBtn = resetViewerBtn,
+
+		durAnchorDD = durAnchorDD,
+		durXBox = durXBox,
+		durYBox = durYBox,
+		durResetBtn = durResetBtn,
+
+		stkAnchorDD = stkAnchorDD,
+		stkXBox = stkXBox,
+		stkYBox = stkYBox,
+		stkResetBtn = stkResetBtn,
 
 		enableAllBtn = enableAllBtn,
 		disableAllBtn = disableAllBtn,
@@ -791,6 +1281,23 @@ function BST:BuildConfigWindow()
 		_syncListWidth = SyncListWidth,
 		_layoutBottom = LayoutBottomButtons,
 	}
+
+	-- Dropdown init
+	local function InitAnchorDropdown(dd, getter, setter)
+		UIDropDownMenu_Initialize(dd, function(_, level)
+			local info = UIDropDownMenu_CreateInfo()
+			for i = 1, #ANCHORS do
+				local key = ANCHORS[i].key
+				info.text = ANCHORS[i].text
+				info.checked = (getter() == key)
+				info.func = function()
+					setter(key)
+					UIDropDownMenu_SetText(dd, ANCHOR_TEXT[key] or key)
+				end
+				UIDropDownMenu_AddButton(info, level)
+			end
+		end)
+	end
 
 	-- Handlers
 	mmCheck:SetScript("OnClick", function(btn)
@@ -813,59 +1320,92 @@ function BST:BuildConfigWindow()
 	end)
 
 	refreshBtn:SetScript("OnClick", function()
-		BST:DiscoverViewers()
-		BST:RefreshConfig()
+		BST:DiscoverViewersCheap()
+		BST:RequestFullScan()
 	end)
 
 	enableAllBtn:SetScript("OnClick", function() BST:SetAllSwipe(true) end)
 	disableAllBtn:SetScript("OnClick", function() BST:SetAllSwipe(false) end)
-	resetAllBtn:SetScript("OnClick", function() BST:ResetAllTextOffsets() end)
+	resetAllBtn:SetScript("OnClick", function() BST:ResetAllOffsets() end)
 
-	local function CommitXY()
+	local function SelectedViewer()
 		local db = BST:GetActiveDB(); EnsureTables(db)
 		local vn = db.ui.selectedViewer
-		if not vn or vn == "" then return end
-		local curX, curY = BST:GetTextPos(vn)
-		local newX = ClampInt(tonumber(xBox:GetText()) or curX, -200, 200)
-		local newY = ClampInt(tonumber(yBox:GetText()) or curY, -200, 200)
-		BST:SetTextPos(vn, newX, newY)
+		if not vn or vn == "" then return nil end
+		return vn
 	end
 
-	xBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); CommitXY() end)
-	yBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); CommitXY() end)
-	xBox:SetScript("OnEditFocusLost", CommitXY)
-	yBox:SetScript("OnEditFocusLost", CommitXY)
+	local function CommitDurationXY()
+		local vn = SelectedViewer(); if not vn then return end
+		local a, curX, curY = BST:GetDurationPos(vn)
+		local newX = ClampInt(tonumber(durXBox:GetText()) or curX, -200, 200)
+		local newY = ClampInt(tonumber(durYBox:GetText()) or curY, -200, 200)
+		BST:SetDurationPos(vn, a, newX, newY)
+	end
+	local function CommitStackXY()
+		local vn = SelectedViewer(); if not vn then return end
+		local a, curX, curY = BST:GetStackPos(vn)
+		local newX = ClampInt(tonumber(stkXBox:GetText()) or curX, -200, 200)
+		local newY = ClampInt(tonumber(stkYBox:GetText()) or curY, -200, 200)
+		BST:SetStackPos(vn, a, newX, newY)
+	end
+
+	durXBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); CommitDurationXY() end)
+	durYBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); CommitDurationXY() end)
+	durXBox:SetScript("OnEditFocusLost", CommitDurationXY)
+	durYBox:SetScript("OnEditFocusLost", CommitDurationXY)
+
+	stkXBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); CommitStackXY() end)
+	stkYBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); CommitStackXY() end)
+	stkXBox:SetScript("OnEditFocusLost", CommitStackXY)
+	stkYBox:SetScript("OnEditFocusLost", CommitStackXY)
 
 	swipeCB:SetScript("OnClick", function(btn)
-		local db = BST:GetActiveDB(); EnsureTables(db)
-		local vn = db.ui.selectedViewer
-		if not vn or vn == "" then
-			btn:SetChecked(false)
-			return
-		end
+		local vn = SelectedViewer()
+		if not vn then btn:SetChecked(false); return end
 		BST:SetSwipeEnabled(vn, btn:GetChecked())
 	end)
 
-	resetViewerBtn:SetScript("OnClick", function()
-		local db = BST:GetActiveDB(); EnsureTables(db)
-		local vn = db.ui.selectedViewer
-		if not vn or vn == "" then return end
-		BST:ResetTextPos(vn)
+	durResetBtn:SetScript("OnClick", function()
+		local vn = SelectedViewer(); if not vn then return end
+		BST:ResetDurationPos(vn)
+	end)
+	stkResetBtn:SetScript("OnClick", function()
+		local vn = SelectedViewer(); if not vn then return end
+		BST:ResetStackPos(vn)
 	end)
 
+	InitAnchorDropdown(durAnchorDD,
+		function()
+			local vn = SelectedViewer(); if not vn then return "CENTER" end
+			return (select(1, BST:GetDurationPos(vn)))
+		end,
+		function(newAnchor)
+			local vn = SelectedViewer(); if not vn then return end
+			local _, x, y = BST:GetDurationPos(vn)
+			BST:SetDurationPos(vn, newAnchor, x, y)
+		end
+	)
+
+	InitAnchorDropdown(stkAnchorDD,
+		function()
+			local vn = SelectedViewer(); if not vn then return "BOTTOMRIGHT" end
+			return (select(1, BST:GetStackPos(vn)))
+		end,
+		function(newAnchor)
+			local vn = SelectedViewer(); if not vn then return end
+			local _, x, y = BST:GetStackPos(vn)
+			BST:SetStackPos(vn, newAnchor, x, y)
+		end
+	)
+
 	f:SetScript("OnShow", function()
-		BST:DiscoverViewers()
+		BST:DiscoverViewersCheap()
 		SyncListWidth()
 		LayoutBottomButtons()
 		BST:RefreshConfig()
+		BST:RequestFullScan()
 	end)
-end
-
-function BST:GetSortedViewerNames()
-	self:DiscoverViewers()
-	local names = self:GetViewerNamesRaw()
-	table.sort(names)
-	return names
 end
 
 function BST:SetSelectedViewer(vn)
@@ -878,8 +1418,10 @@ function BST:RefreshConfig()
 	if not self.configFrame or not self.ui then return end
 	self:EnsureInit()
 
-	local db = self:GetActiveDB(); EnsureTables(db)
-	self:DiscoverViewers()
+	local db = self:GetActiveDB()
+	EnsureTables(db)
+
+	self:DiscoverViewersCheap()
 
 	self.ui.mmCheck:SetChecked(not not db.minimap.show)
 	self.ui.useChar:SetChecked(self:UseCharSettings())
@@ -896,9 +1438,7 @@ function BST:RefreshConfig()
 		for i = 1, #names do
 			if names[i] == db.ui.selectedViewer then ok = true break end
 		end
-		if not ok then
-			db.ui.selectedViewer = (#names > 0) and names[1] or ""
-		end
+		if not ok then db.ui.selectedViewer = (#names > 0) and names[1] or "" end
 	end
 
 	if self.ui._syncListWidth then self.ui._syncListWidth() end
@@ -913,7 +1453,7 @@ function BST:RefreshConfig()
 
 	local y = -PAD
 	local width = content:GetWidth()
-	if not width or width < 40 then width = 240 end
+	if not width or width < 40 then width = 260 end
 
 	for i = 1, #names do
 		local vn = names[i]
@@ -978,23 +1518,35 @@ function BST:RefreshConfig()
 	if selected == "" then
 		self.ui.selName:SetText("None")
 		self.ui.swipeCB:SetChecked(false)
-		SetIfNotFocused(self.ui.xBox, "")
-		SetIfNotFocused(self.ui.yBox, "")
+
+		UIDropDownMenu_SetText(self.ui.durAnchorDD, ANCHOR_TEXT["CENTER"])
+		UIDropDownMenu_SetText(self.ui.stkAnchorDD, ANCHOR_TEXT["BOTTOMRIGHT"])
+
+		SetIfNotFocused(self.ui.durXBox, "")
+		SetIfNotFocused(self.ui.durYBox, "")
+		SetIfNotFocused(self.ui.stkXBox, "")
+		SetIfNotFocused(self.ui.stkYBox, "")
+
 		self.ui.swipeCB:Disable()
-		self.ui.xBox:Disable()
-		self.ui.yBox:Disable()
-		self.ui.resetViewerBtn:Disable()
+		self.ui.durXBox:Disable(); self.ui.durYBox:Disable(); self.ui.durResetBtn:Disable()
+		self.ui.stkXBox:Disable(); self.ui.stkYBox:Disable(); self.ui.stkResetBtn:Disable()
 	else
 		self.ui.selName:SetText(selected)
 		self.ui.swipeCB:Enable()
-		self.ui.xBox:Enable()
-		self.ui.yBox:Enable()
-		self.ui.resetViewerBtn:Enable()
+		self.ui.durXBox:Enable(); self.ui.durYBox:Enable(); self.ui.durResetBtn:Enable()
+		self.ui.stkXBox:Enable(); self.ui.stkYBox:Enable(); self.ui.stkResetBtn:Enable()
 
 		self.ui.swipeCB:SetChecked(self:IsSwipeEnabled(selected))
-		local x, yy = self:GetTextPos(selected)
-		SetIfNotFocused(self.ui.xBox, tostring(x))
-		SetIfNotFocused(self.ui.yBox, tostring(yy))
+
+		local da, dx, dy = self:GetDurationPos(selected)
+		UIDropDownMenu_SetText(self.ui.durAnchorDD, ANCHOR_TEXT[da] or da)
+		SetIfNotFocused(self.ui.durXBox, tostring(dx))
+		SetIfNotFocused(self.ui.durYBox, tostring(dy))
+
+		local sa, sx, sy = self:GetStackPos(selected)
+		UIDropDownMenu_SetText(self.ui.stkAnchorDD, ANCHOR_TEXT[sa] or sa)
+		SetIfNotFocused(self.ui.stkXBox, tostring(sx))
+		SetIfNotFocused(self.ui.stkYBox, tostring(sy))
 	end
 end
 
@@ -1009,11 +1561,18 @@ end
 function BST:ToggleConfig()
 	SafeCall(function()
 		self:BuildConfigWindow()
-		if self.configFrame:IsShown() then self.configFrame:Hide() else self:OpenConfig() end
+		if self.configFrame:IsShown() then
+			self.configFrame:Hide()
+		else
+			self:OpenConfig()
+		end
 	end)
 end
 
--- ---------- Settings entry ----------
+-- -------------------------------------------------------
+-- Settings category (Settings / Edit Mode)
+-- -------------------------------------------------------
+
 function BST:RegisterSettingsCategory()
 	if _G.Settings and type(_G.Settings.RegisterCanvasLayoutCategory) == "function" then
 		local panel = CreateFrame("Frame")
@@ -1023,13 +1582,16 @@ function BST:RegisterSettingsCategory()
 		btn:SetPoint("TOPLEFT", 16, -16)
 		btn:SetText("Open Buff Swipe Toggle")
 		StyleGreyButton(btn)
-		btn:SetScript("OnClick", function() BST:OpenConfig() end)
+		btn:SetScript("OnClick", function() BST:ToggleConfig() end)
 		local cat = _G.Settings.RegisterCanvasLayoutCategory(panel, "Buff Swipe Toggle")
 		_G.Settings.RegisterAddOnCategory(cat)
 	end
 end
 
--- ---------- Minimap button ----------
+-- -------------------------------------------------------
+-- Minimap button
+-- -------------------------------------------------------
+
 function BST:GetMinimapDB()
 	self:EnsureInit()
 	local db = self:GetActiveDB()
@@ -1081,12 +1643,13 @@ function BST:CreateMinimapButton()
 	b:SetScript("OnEnter", function(btn)
 		GameTooltip:SetOwner(btn, "ANCHOR_LEFT")
 		GameTooltip:AddLine("Buff Swipe Toggle")
-		GameTooltip:AddLine("Click: Open", 0.9, 0.9, 0.9)
+		GameTooltip:AddLine("Click: Toggle window", 0.9, 0.9, 0.9)
 		GameTooltip:AddLine("Drag: Move", 0.9, 0.9, 0.9)
 		GameTooltip:Show()
 	end)
 	b:SetScript("OnLeave", function() GameTooltip:Hide() end)
-	b:SetScript("OnClick", function() BST:OpenConfig() end)
+
+	b:SetScript("OnClick", function() BST:ToggleConfig() end)
 
 	b:SetScript("OnDragStart", function(btn)
 		btn:SetScript("OnUpdate", function()
@@ -1108,30 +1671,35 @@ function BST:CreateMinimapButton()
 	self:UpdateMinimapButton()
 end
 
--- ---------- Addon Compartment ----------
-function BuffSwipeToggle_OnAddonCompartmentClick(addonName, buttonName) BST:OpenConfig() end
+-- -------------------------------------------------------
+-- Addon Compartment
+-- -------------------------------------------------------
 
--- ---------- Refresh ----------
-function BST:RefreshAll()
-	self:Apply()
-	self:UpdateMinimapButton()
+function BuffSwipeToggle_OnAddonCompartmentClick(addonName, buttonName)
+	BST:ToggleConfig()
 end
 
--- ---------- Slash command ----------
+-- -------------------------------------------------------
+-- Slash command
+-- -------------------------------------------------------
+
 SLASH_BUFFSWIPETOGGLE1 = "/bst"
-SlashCmdList["BUFFSWIPETOGGLE"] = function(msg)
-	msg = (msg or ""):lower():match("^%s*(.-)%s*$")
+SlashCmdList["BUFFSWIPETOGGLE"] = function()
 	SafeCall(function()
 		BST:EnsureInit()
 		BST:ToggleConfig()
 	end)
 end
 
--- ---------- Events ----------
+-- -------------------------------------------------------
+-- Events
+-- -------------------------------------------------------
+
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED")
+eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
 eventFrame:SetScript("OnEvent", function(_, event, arg1)
 	if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
@@ -1143,15 +1711,21 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1)
 		SafeCall(function()
 			BST:RegisterSettingsCategory()
 			BST:CreateMinimapButton()
-			BST:TryHookCooldownFrameSet()
-			BST:ScheduleApplyRetries()
-			BST:DiscoverViewers()
+			BST:TryHookCooldownSetters()
+			BST:DiscoverViewersCheap()
+			BST:RequestFullScan()
 			BST:Print("Loaded. Use /bst to open.")
 		end)
 		return
 	end
 
 	if event == "COOLDOWN_VIEWER_DATA_LOADED" then
-		SafeCall(function() BST:Apply() end)
+		SafeCall(function() BST:RequestFullScan() end)
+		return
+	end
+
+	if event == "PLAYER_REGEN_ENABLED" then
+		SafeCall(function() BST:RequestFullScan() end)
+		return
 	end
 end)
