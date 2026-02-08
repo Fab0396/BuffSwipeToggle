@@ -1,13 +1,12 @@
+## NOTE: Keep your existing Interface number if your addon already loads.
+## Interface: 120000
 ## Title: Buff Swipe Toggle
-## Notes: Toggle cooldown swipe per Blizzard CooldownViewer + move duration/stack text
+## Notes: Per CooldownViewer swipe + duration/stack text positioning.
 ## Author: You
 ## Version: 1.0.0
-## Interface: 120000
-
 ## SavedVariables: BuffSwipeToggleDB
 ## SavedVariablesPerCharacter: BuffSwipeToggleCharDB
-
-## IconTexture: Interface\Icons\INV_Misc_PocketWatch_01
 ## AddonCompartmentFunc: BuffSwipeToggle_OnAddonCompartmentClick
+## IconTexture: Interface\AddOns\BuffSwipeToggle\Media\Logo
 
 BuffSwipeToggle.lua
