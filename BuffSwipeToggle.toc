@@ -3,10 +3,11 @@
 ## Title: Buff Swipe Toggle
 ## Notes: Per CooldownViewer swipe + duration/stack text positioning.
 ## Author: You
-## Version: 1.0.0
+## Version: 1.0.5
 ## SavedVariables: BuffSwipeToggleDB
 ## SavedVariablesPerCharacter: BuffSwipeToggleCharDB
 ## AddonCompartmentFunc: BuffSwipeToggle_OnAddonCompartmentClick
 ## IconTexture: Interface\AddOns\BuffSwipeToggle\Media\Logo
 
 BuffSwipeToggle.lua
+Options.lua
